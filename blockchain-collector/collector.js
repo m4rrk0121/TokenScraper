@@ -156,7 +156,7 @@ const logger = require('../shared/utils/logger');
         logger.info(`Current block: ${currentBlock}`);
         
         // Only scan the last 50,000 blocks
-        const BLOCK_RANGE = 500;
+        const BLOCK_RANGE = 200;
         const START_BLOCK = Math.max(0, currentBlock - BLOCK_RANGE);
         
         logger.info(`Scanning the last ${BLOCK_RANGE} blocks from ${START_BLOCK} to ${currentBlock}`);
@@ -230,7 +230,9 @@ const logger = require('../shared/utils/logger');
                   symbol,
                   decimals: 18,
                   createdAt: new Date(log.blockNumber * 2000), // Approximate timestamp
-                  deployer: finalDeployer.toLowerCase()
+                  deployer: finalDeployer.toLowerCase(),
+                  supply: supply,
+                  blockNumber: log.blockNumber // Add the block number here
                 });
               } catch (error) {
                 logger.error(`Error decoding event data:`, error.message);
