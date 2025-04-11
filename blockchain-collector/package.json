@@ -1,0 +1,24 @@
+{
+  "name": "token-tracker-blockchain-collector",
+  "version": "1.0.0",
+  "description": "Blockchain event collector for token tracking application",
+  "main": "collector.js",
+  "scripts": {
+    "start": "node collector.js",
+    "dev": "nodemon collector.js"
+  },
+  "dependencies": {
+    "axios": "^1.8.4",
+    "dotenv": "^16.5.0",
+    "ethers": "^6.13.5",
+    "mongoose": "^8.13.2",
+    "node-cron": "^3.0.3",
+    "winston": "^3.17.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
