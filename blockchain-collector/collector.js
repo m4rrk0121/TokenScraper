@@ -6,6 +6,8 @@ const axios = require('axios');
 const db = require('../shared/config/db');
 const { ethers } = require('ethers');
 const logger = require('../shared/utils/logger');
+const fs = require('fs').promises;
+const path = require('path');
 
 // Wrap everything in an async IIFE (Immediately Invoked Function Expression)
 (async function() {
@@ -26,11 +28,28 @@ const logger = require('../shared/utils/logger');
     
     // Define the TokenCreated event signature
     const TOKEN_CREATED_EVENT = 'TokenCreated(address,uint256,address,string,string,uint256,address,uint256)';
-    
-    // Define the KOA factory interface for decoding - using the CORRECT function signature from the contract
+
+    // Define the KOA factory interface for decoding
     const koaFactoryInterface = new ethers.Interface([
       "function deployToken(string _name, string _symbol, uint256 _supply, int24 _initialTick, uint24 _fee, bytes32 _salt, address _deployer, address _recipient, uint256 _recipientAmount) payable returns (address tokenAddress, uint256 tokenId)"
     ]);
+    
+    // State file path
+    const STATE_FILE = path.join(__dirname, '../../state/blockState.json');
+
+    // Rate limiting configuration
+    const RATE_LIMIT = {
+      initialDelay: 1000, // 1 second
+      maxDelay: 30000,    // 30 seconds
+      backoffFactor: 1.5  // Exponential backoff factor
+    };
+
+    // Batch processing configuration
+    const BATCH_CONFIG = {
+      maxBatchSize: 50,    // Maximum tokens to process in one batch
+      minBatchSize: 10,    // Minimum tokens to process in one batch
+      batchTimeout: 5000   // 5 seconds timeout for batch processing
+    };
 
     // Map of known transaction hashes to their correct deployer addresses
     const KNOWN_DEPLOYERS = {
@@ -138,15 +157,63 @@ const logger = require('../shared/utils/logger');
       }
     }
     
+    // Get the last processed block number
+    async function getLastProcessedBlock() {
+      try {
+        const data = await fs.readFile(STATE_FILE, 'utf8');
+        return JSON.parse(data).lastBlock;
+      } catch (error) {
+        // If file doesn't exist, return 0
+        return 0;
+      }
+    }
+
+    // Save the last processed block number
+    async function saveLastProcessedBlock(blockNumber) {
+      try {
+        await fs.mkdir(path.dirname(STATE_FILE), { recursive: true });
+        await fs.writeFile(STATE_FILE, JSON.stringify({ lastBlock: blockNumber }));
+      } catch (error) {
+        logger.error('Error saving last processed block:', error);
+      }
+    }
+
+    // Process tokens in batches with rate limiting
+    async function processTokensInBatches(tokens, provider) {
+      const batches = [];
+      for (let i = 0; i < tokens.length; i += BATCH_CONFIG.maxBatchSize) {
+        batches.push(tokens.slice(i, i + BATCH_CONFIG.maxBatchSize));
+      }
+
+      let delay = RATE_LIMIT.initialDelay;
+      for (const batch of batches) {
+        try {
+          // Process the batch
+          await tokenStorageService.storeTokens(batch);
+          logger.info(`Processed batch of ${batch.length} tokens`);
+
+          // Add delay between batches
+          if (batches.indexOf(batch) < batches.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, delay));
+            delay = Math.min(delay * RATE_LIMIT.backoffFactor, RATE_LIMIT.maxDelay);
+          }
+        } catch (error) {
+          logger.error('Error processing batch:', error);
+          // On error, increase delay more aggressively
+          delay = Math.min(delay * RATE_LIMIT.backoffFactor * 2, RATE_LIMIT.maxDelay);
+        }
+      }
+    }
+
     /**
-     * Fetch tokens deployed by KOA factory for the last 50,000 blocks
+     * Fetch tokens deployed by KOA factory
      */
     async function fetchAndStoreTokens() {
       try {
         logger.info('Fetching tokens deployed by KOA factory...');
         
-        // Create a simplified RPC provider
-        const provider = new ethers.JsonRpcProvider(process.env.BASE_RPC_URL || "https://rpc.ankr.com/base");
+        // Create a provider with rate limiting
+        const provider = new ethers.JsonRpcProvider(process.env.BASE_RPC_URL);
         
         // Calculate the event topic
         const eventTopic = ethers.id(TOKEN_CREATED_EVENT);
@@ -155,17 +222,31 @@ const logger = require('../shared/utils/logger');
         const currentBlock = await provider.getBlockNumber();
         logger.info(`Current block: ${currentBlock}`);
         
-        // Only scan the last 50,000 blocks
-        const BLOCK_RANGE = 200;
-        const START_BLOCK = Math.max(0, currentBlock - BLOCK_RANGE);
+        // Get last processed block
+        const lastProcessedBlock = await getLastProcessedBlock();
+        logger.info(`Last processed block: ${lastProcessedBlock}`);
         
-        logger.info(`Scanning the last ${BLOCK_RANGE} blocks from ${START_BLOCK} to ${currentBlock}`);
+        // If we're up to date, no need to scan
+        if (currentBlock <= lastProcessedBlock) {
+          logger.info('Already up to date with blockchain');
+          return;
+        }
         
-        // Process in chunks of 10,000 blocks to avoid timeout issues
-        const CHUNK_SIZE = 50000;
+        // Calculate scan range (with a maximum limit)
+        const MAX_BLOCKS_PER_SCAN = 2000; // Increased from 200 to reduce API calls
+        const scanRange = Math.min(
+          currentBlock - lastProcessedBlock,
+          MAX_BLOCKS_PER_SCAN
+        );
+        
+        const startBlock = Math.max(0, currentBlock - scanRange);
+        logger.info(`Scanning blocks ${startBlock} to ${currentBlock} [${scanRange} blocks]`);
+        
+        // Process in chunks to avoid timeout issues
+        const CHUNK_SIZE = 1000;
         const allTokens = [];
         
-        for (let chunkStart = START_BLOCK; chunkStart < currentBlock; chunkStart += CHUNK_SIZE) {
+        for (let chunkStart = startBlock; chunkStart < currentBlock; chunkStart += CHUNK_SIZE) {
           const chunkEnd = Math.min(chunkStart + CHUNK_SIZE - 1, currentBlock);
           
           logger.info(`Processing block chunk ${chunkStart} to ${chunkEnd} [${chunkEnd - chunkStart + 1} blocks]`);
@@ -184,7 +265,6 @@ const logger = require('../shared/utils/logger');
             logger.info(`Found ${logs.length} token creation events in blocks ${chunkStart}-${chunkEnd}`);
             
             // Process the logs
-            const chunkTokens = [];
             for (const log of logs) {
               try {
                 // The event parameters are ABI encoded in the data field
@@ -198,79 +278,53 @@ const logger = require('../shared/utils/logger');
                 const symbol = decodedData[4];
                 const supply = decodedData[5];
                 
-                // Get the deployer from the transaction input parameters
-                // This is what you want - the _deployer parameter, not the event's deployer (which is tx.from)
-                const paramDeployer = await getDeployerFromTransaction(log.transactionHash, provider);
+                // Get deployer from transaction
+                const deployer = await getDeployerFromTransaction(log.transactionHash, provider);
                 
-                // If we couldn't get the parameter deployer, fall back to legacy deployer from event
-                const legacyDeployer = decodedData[2]; // This is actually tx.from based on the contract
-                
-                let finalDeployer;
-                if (paramDeployer && !shouldExcludeAddress(paramDeployer)) {
-                  // Use the parameter deployer if available and not excluded
-                  finalDeployer = paramDeployer;
-                  logger.info(`Using _deployer parameter as deployer: ${finalDeployer}`);
-                } else if (!shouldExcludeAddress(legacyDeployer)) {
-                  // Fall back to legacy deployer if parameter deployer not available
-                  finalDeployer = legacyDeployer;
-                  logger.info(`Parameter deployer not available, using legacy deployer: ${legacyDeployer}`);
-                } else {
-                  // If both are excluded, use a reasonable fallback
-                  const tx = await provider.getTransaction(log.transactionHash);
-                  finalDeployer = tx?.from || 'unknown';
-                  logger.info(`All deployer options excluded, using transaction sender: ${finalDeployer}`);
-                }
-                
-                logger.info(`Found token: ${name} (${symbol}) at ${tokenAddress}`);
-                logger.info(`Legacy deployer: ${legacyDeployer}, Parameter deployer: ${paramDeployer || 'not found'}, Final deployer: ${finalDeployer}`);
-                
-                chunkTokens.push({
+                const tokenData = {
                   contractAddress: tokenAddress.toLowerCase(),
-                  name,
-                  symbol,
+                  name: name,
+                  symbol: symbol,
                   decimals: 18,
-                  createdAt: new Date(log.blockNumber * 2000), // Approximate timestamp
-                  deployer: finalDeployer.toLowerCase(),
-                  supply: supply,
-                  blockNumber: log.blockNumber // Add the block number here
-                });
-              } catch (error) {
-                logger.error(`Error decoding event data:`, error.message);
-              }
-            }
-            
-            // Store tokens from this chunk if any were found
-            if (chunkTokens.length > 0) {
-              allTokens.push(...chunkTokens);
-              
-              // Process this chunk's tokens right away
-              try {
-                logger.info(`Storing ${chunkTokens.length} tokens from blocks ${chunkStart}-${chunkEnd}`);
-                const result = await tokenStorageService.storeTokens(chunkTokens);
-                logger.info(`Chunk storage complete: ${result.newTokens} new, ${result.updatedTokens} updated from blocks ${chunkStart}-${chunkEnd}`);
+                  supply: supply.toString(),
+                  deployer: deployer ? deployer.toLowerCase() : null,
+                  createdAt: new Date(),
+                  transactionHash: log.transactionHash,
+                  blockNumber: log.blockNumber
+                };
                 
-                // Find and store V3 pool information for new tokens
-                logger.info(`Looking for V3 pools for tokens from blocks ${chunkStart}-${chunkEnd}`);
-                await poolService.processTokenPools(chunkTokens, provider);
-              } catch (storageError) {
-                logger.error(`Error storing tokens from blocks ${chunkStart}-${chunkEnd}:`, storageError);
+                allTokens.push(tokenData);
+              } catch (error) {
+                logger.error(`Error decoding event data:`, error);
               }
-            } else {
-              logger.info(`No tokens found in blocks ${chunkStart}-${chunkEnd}`);
             }
             
-            // Add a delay between chunks to avoid rate limiting
+            // Add delay between chunks to avoid rate limiting
             if (chunkEnd < currentBlock) {
-              logger.info('Pausing briefly before processing next block chunk...');
-              await new Promise(resolve => setTimeout(resolve, 1000));
+              const delay = Math.min(
+                RATE_LIMIT.initialDelay * Math.pow(RATE_LIMIT.backoffFactor, Math.floor((chunkEnd - startBlock) / CHUNK_SIZE)),
+                RATE_LIMIT.maxDelay
+              );
+              await new Promise(resolve => setTimeout(resolve, delay));
             }
-          } catch (chunkError) {
-            logger.error(`Error processing block chunk ${chunkStart}-${chunkEnd}:`, chunkError);
-            // Continue with next chunk even if this one failed
+          } catch (error) {
+            logger.error(`Error processing block chunk ${chunkStart}-${chunkEnd}:`, error);
+            // On error, wait longer before next chunk
+            await new Promise(resolve => setTimeout(resolve, RATE_LIMIT.maxDelay));
           }
         }
         
-        logger.info(`Completed scanning ${currentBlock - START_BLOCK} blocks. Found total of ${allTokens.length} tokens`);
+        // Process all found tokens in batches
+        if (allTokens.length > 0) {
+          await processTokensInBatches(allTokens, provider);
+          logger.info(`Processed ${allTokens.length} tokens from blocks ${startBlock} to ${currentBlock}`);
+        } else {
+          logger.info('No new tokens found');
+        }
+        
+        // Save the last processed block
+        await saveLastProcessedBlock(currentBlock);
+        
       } catch (error) {
         logger.error('Error in fetchAndStoreTokens:', error);
       }
@@ -284,7 +338,7 @@ const logger = require('../shared/utils/logger');
         logger.info('Checking for V3 pools for existing tokens...');
         
         // Create provider for querying pools
-        const provider = new ethers.JsonRpcProvider(process.env.BASE_RPC_URL || "https://rpc.ankr.com/base");
+        const provider = new ethers.JsonRpcProvider(process.env.BASE_RPC_URL);
         
         // Get tokens that haven't been checked for pools yet
         const tokensToCheck = await Token.find(
@@ -349,3 +403,4 @@ const logger = require('../shared/utils/logger');
     process.exit(1);
   }
 })();
+
