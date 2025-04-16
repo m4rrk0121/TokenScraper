@@ -29,7 +29,8 @@ function decodeTokenCreatedEvent(log) {
       symbol,
       decimals: 18, // ERC20 tokens deployed by KOA have 18 decimals
       createdAt: new Date(), // We could estimate from block number but this is more accurate
-      deployer: deployer.toLowerCase()
+      deployer: deployer.toLowerCase(),
+      blockNumber: log.blockNumber
     };
   } catch (error) {
     logger.error(`Error decoding event data:`, error);

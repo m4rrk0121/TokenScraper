@@ -19,7 +19,15 @@ async function storeTokens(tokens) {
     const operations = tokens.map(token => ({
       updateOne: {
         filter: { contractAddress: token.contractAddress.toLowerCase() },
-        update: { $set: token },
+        update: { 
+          $set: {
+            ...token,
+            blockNumber: undefined // Remove blockNumber from $set
+          },
+          $setOnInsert: { 
+            blockNumber: token.blockNumber // Only set blockNumber on insert
+          }
+        },
         upsert: true
       }
     }));

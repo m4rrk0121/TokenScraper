@@ -233,7 +233,8 @@ const path = require('path');
         }
         
         // Calculate scan range (with a maximum limit)
-        const MAX_BLOCKS_PER_SCAN = 2000; // Increased from 200 to reduce API calls
+        const MAX_BLOCKS_PER_SCAN = 500; // Scan last 500 blocks
+        
         const scanRange = Math.min(
           currentBlock - lastProcessedBlock,
           MAX_BLOCKS_PER_SCAN
